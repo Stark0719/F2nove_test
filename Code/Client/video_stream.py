@@ -1,161 +1,163 @@
+# video_stream.py
 import socket
 import cv2
 import numpy as np
 import struct
 from PIL import Image
 import io
+import threading
+import sys
 
 class VideoStream:
-    def __init__(self, server_ip, video_port):
+    def __init__(self, server_ip, video_port, haarcascade_path="haarcascade_frontalface_default.xml"):
         self.server_ip = server_ip
         self.video_port = video_port
+
+        # For controlling streaming and threading
         self.video_streaming = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+        # Shared frame in BGR, updated every time we decode
+        self.current_frame = None
+
+        # Face detection
+        self.track_face = False  # Toggle on/off from the main script if desired
+        self.face_cascade = cv2.CascadeClassifier(haarcascade_path)
+        self.face_x = 0.0
+        self.face_y = 0.0
 
     def start(self):
-        if not self.video_streaming:
-            self.video_streaming = True
-            self._stream_video()
+        """Start streaming in a background thread."""
+        if self.video_streaming:
+            print("[VideoStream] Already streaming.")
+            return
+
+        print("[VideoStream] Starting stream (background thread)...")
+        self.video_streaming = True
+        self.thread = threading.Thread(target=self._stream_video, daemon=True)
+        self.thread.start()
 
     def stop(self):
-        self.video_streaming = False
+        """Stop the video stream and wait for the thread to finish."""
+        if self.video_streaming:
+            print("[VideoStream] Stopping stream...")
+            self.video_streaming = False
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=2)
+            self.thread = None
 
-    def _is_valid_image(self, buf):
-        """Validate if the received buffer is a valid JPEG image."""
-        if buf[6:10] in (b'JFIF', b'Exif'):
-            if not buf.rstrip(b'\0\r\n').endswith(b'\xff\xd9'):
-                return False
-        try:
-            Image.open(io.BytesIO(buf)).verify()
-            return True
-        except Exception:
-            return False
+        self.face_x = 0.0
+        self.face_y = 0.0
+        self.current_frame = None
+        print("[VideoStream] Stream stopped.")
+
+    def enable_face_tracking(self, enabled=True):
+        """Toggle face detection on/off."""
+        self.track_face = enabled
+
+    def get_frame(self):
+        """
+        Return a copy of the latest frame (thread-safe).
+        Return None if no frame is available.
+        """
+        with self.lock:
+            if self.current_frame is not None:
+                return self.current_frame.copy()
+            return None
+
+    def get_face_coords(self):
+        """Returns (face_x, face_y) as last detected face center, or (0,0) if none."""
+        return (self.face_x, self.face_y)
 
     def _stream_video(self):
-        """Stream video from the server."""
         try:
             video_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             video_socket.connect((self.server_ip, self.video_port))
-            print("Connected to video stream.")
-
-            stream_bytes = b""
+            print("[VideoStream] Connected to video stream.")
 
             while self.video_streaming:
                 # Read the 4-byte frame size
-                frame_header = video_socket.recv(4)
-                if len(frame_header) < 4:
-                    print("Incomplete frame header. Stopping stream.")
+                header = video_socket.recv(4)
+                if len(header) < 4:
+                    print("[VideoStream] Incomplete frame header, stopping...")
                     break
 
-                frame_size = struct.unpack('<L', frame_header)[0]
+                frame_size = struct.unpack('<L', header)[0]
+                if frame_size <= 0:
+                    print("[VideoStream] Invalid frame size, stopping...")
+                    break
 
-                # Read the frame data
+                # Read entire frame
                 frame_data = b""
                 while len(frame_data) < frame_size:
                     packet = video_socket.recv(frame_size - len(frame_data))
                     if not packet:
-                        print("Incomplete frame data. Stopping stream.")
+                        print("[VideoStream] Incomplete frame data, stopping...")
                         break
                     frame_data += packet
 
-                if not self._is_valid_image(frame_data):
-                    print("Invalid frame received.")
+                # Validate / decode
+                if not self._is_valid_jpeg(frame_data):
+                    print("[VideoStream] Invalid frame, skipping...")
                     continue
 
-                # Decode and display the frame
-                frame = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
-                if frame is not None:
-                    cv2.imshow("Raspberry Pi Video Stream", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        self.video_streaming = False
-                        break
+                frame_bgr = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+                if frame_bgr is not None:
+                    # Optionally detect faces
+                    if self.track_face:
+                        frame_bgr = self._detect_and_draw_face(frame_bgr)
+
+                    # Update shared frame
+                    with self.lock:
+                        self.current_frame = frame_bgr
+                else:
+                    print("[VideoStream] Failed to decode frame.")
 
             video_socket.close()
-            cv2.destroyAllWindows()
-            print("Video stream stopped.")
+            print("[VideoStream] Socket closed.")
         except Exception as e:
-            print(f"Error in video streaming: {e}")
-            cv2.destroyAllWindows()
+            print(f"[VideoStream] Error: {e}")
+        finally:
+            self.video_streaming = False
+            with self.lock:
+                self.current_frame = None
+            print("[VideoStream] _stream_video thread exited.")
 
+    def _detect_and_draw_face(self, img_bgr):
+        """
+        Detect faces in BGR image, draw a circle around the first face,
+        and update self.face_x, self.face_y as the face center.
+        """
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        if len(faces) > 0:
+            # For simplicity, take the first face
+            (x, y, w, h) = faces[0]
+            self.face_x = x + w/2.0
+            self.face_y = y + h/2.0
+            # Draw a circle around the face
+            center = (int(self.face_x), int(self.face_y))
+            radius = int((w+h)/4)
+            cv2.circle(img_bgr, center, radius, (0, 255, 0), 2)
+        else:
+            # No face detected
+            self.face_x = 0.0
+            self.face_y = 0.0
 
+        return img_bgr
 
-
-
-
-
-# ### Video Stream Module (video_stream.py)
-# import socket
-# import cv2
-# import numpy as np
-# import threading
-
-# class VideoStream:
-#     def __init__(self, server_ip, video_port):
-#         self.server_ip = server_ip
-#         self.video_port = video_port
-#         self.video_streaming = False
-#         self.stream_thread = None
-
-#     def start(self):
-#         if not self.video_streaming:
-#             self.video_streaming = True
-#             self.stream_thread = threading.Thread(target=self._stream_video)
-#             self.stream_thread.start()
-
-#     def stop(self):
-#         self.video_streaming = False
-#         if self.stream_thread and self.stream_thread.is_alive():
-#             self.stream_thread.join()
-
-#     def _stream_video(self):
-#         try:
-#             video_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#             video_socket.connect((self.server_ip, self.video_port))
-#             print("Connected to video stream.")
-
-#             data = b""
-#             payload_size = 4
-
-#             while self.video_streaming:
-#                 while len(data) < payload_size:
-#                     packet = video_socket.recv(4 * 1024)
-#                     if not packet:
-#                         print("No data received. Stopping stream.")
-#                         self.video_streaming = False
-#                         break
-#                     data += packet
-#                 if len(data) < payload_size:
-#                     break
-
-#                 packed_msg_size = data[:payload_size]
-#                 data = data[payload_size:]
-#                 msg_size = int.from_bytes(packed_msg_size, byteorder="little")
-
-#                 while len(data) < msg_size:
-#                     packet = video_socket.recv(4 * 1024)
-#                     if not packet:
-#                         print("Incomplete frame received. Stopping stream.")
-#                         self.video_streaming = False
-#                         break
-#                     data += packet
-#                 if not self.video_streaming:
-#                     break
-
-#                 frame_data = data[:msg_size]
-#                 data = data[msg_size:]
-
-#                 frame = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
-#                 if frame is not None:
-#                     cv2.imshow("Raspberry Pi Video Stream", frame)
-#                     if cv2.waitKey(1) & 0xFF == ord("q"):
-#                         self.video_streaming = False
-#                         break
-#                 else:
-#                     print("Error decoding frame.")
-#                     self.video_streaming = False
-
-#             video_socket.close()
-#             cv2.destroyAllWindows()
-#             print("Video stream stopped.")
-#         except Exception as e:
-#             print(f"Error in video streaming: {e}")
-#             cv2.destroyAllWindows()
+    def _is_valid_jpeg(self, buf):
+        """Quick check if buf is a valid JPEG."""
+        if len(buf) < 4:
+            return False
+        # Check for standard JPEG header
+        if buf[6:10] in (b'JFIF', b'Exif'):
+            if not buf.rstrip(b'\0\r\n').endswith(b'\xff\xd9'):
+                return False
+        # Attempt reading with PIL
+        try:
+            Image.open(io.BytesIO(buf)).verify()
+            return True
+        except:
+            return False
